@@ -25,8 +25,10 @@ edge   { from, to, relationship, minimum_access }
 |---|---|
 | `class` | a class (Python, Swift) |
 | `method` | a function defined in a class body |
-| `protocol` | a Swift protocol (planned) |
-| `extension` | a Swift extension (planned) |
+| `struct` | a Swift struct |
+| `enum` | a Swift enum |
+| `protocol` | a Swift protocol |
+| `extension` | a Swift extension; the members it declares belong to the extended type |
 
 `module` and `function` keep their rr-csg meaning.
 
@@ -52,11 +54,21 @@ py:<path>::<Class>.<method>    a method
 py:<path>::<outer>.<inner>     a nested function
 ```
 
+Swift:
+
+```text
+swift:<path>                         a file
+swift:<path>::<Type>                 a type (nested: Outer.Inner)
+swift:<path>::<Type>.<member>        a method or initializer, with its argument labels: Model.load(from:), Model.init()
+swift:<path>::<function>             a top-level function
+swift:<path>::extension <Type>       an extension (a second one in the same file: extension <Type> #2)
+```
+
 ## Edge relationships
 
 | Relationship | From → to |
 |---|---|
 | `contains` | module → class/function, class → method, function → nested function |
 | `imports` | module → module (repository modules only) |
-| `calls` | function/method → function, method or class (construction) |
+| `calls` | function/method → function, method or class (construction). Swift: from a SwiftPM package's index store |
 | `inherits` | class → base class |

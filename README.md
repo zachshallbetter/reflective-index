@@ -10,7 +10,8 @@ same access-aware slicing works on it. The extensions it needs beyond Rust (clas
 `extractor` provenance for syntax-level facts) are documented as a draft in [docs/SCHEMA.md](docs/SCHEMA.md).
 
 - **Local.** It reads files on this machine. Nothing is sent anywhere.
-- **No dependencies.** The Python standard library only (Python 3.10+).
+- **No dependencies.** The Python standard library only (Python 3.10+). Swift uses the toolchain's own
+  `sourcekit-lsp` (with Xcode or a Swift toolchain installed); without it, Swift files are listed as unparsed.
 - **Certain or silent.** A call is linked only when its target can be resolved for sure. The rest are counted
   as unresolved, never guessed.
 - **Incremental.** Per-file facts are cached by content hash, so a rebuild only re-reads what changed.
@@ -20,7 +21,7 @@ same access-aware slicing works on it. The extensions it needs beyond Rust (clas
 | Language | Extractor | Nodes | Edges |
 |---|---|---|---|
 | Python | standard library `ast` | module, class, function, method | contains, imports, calls, inherits |
-| Swift | planned: `sourcekit-lsp` (symbols, references, call hierarchy) | | |
+| Swift | `sourcekit-lsp` over stdio: document symbols per file; for a SwiftPM package, call hierarchy from its index store (`--swift-calls`) | module, class, struct, enum, protocol, extension, function, method | contains, calls |
 
 ## Use
 
@@ -36,7 +37,13 @@ reflective-index ROOT slice 'py:scripts/routines.py::save' 1
 reflective-index ROOT csg > graph.json
 ```
 
-A symbol is its id (`py:path/file.py::Class.method`) or a name that matches exactly one symbol.
+A symbol is its id (`py:path/file.py::Class.method`, `swift:Sources/App/Model.swift::Model.load(from:)`) or a name
+that matches exactly one symbol.
+
+Swift calls are linked for SwiftPM packages only, and only when asked (`--swift-calls`, or `Index(..., swift_calls=True)`):
+each package is built once with `swift build --enable-index-store` into the cache directory (never the package's own
+`.build`), and its edges are reused until one of its Swift files changes. A call into the SDK or anything outside the
+tree isn't an edge. Files outside a package (an Xcode project's) get structure only.
 
 ### As an MCP server
 
