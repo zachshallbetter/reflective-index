@@ -23,7 +23,7 @@ same access-aware slicing works on it. The extensions it needs beyond Rust (clas
 | Language | Extractor | Nodes | Edges |
 |---|---|---|---|
 | Python | standard library `ast` | module, class, function, method | contains, imports, calls, refs, inherits |
-| Swift | `sourcekit-lsp` over stdio: document symbols per file; for a SwiftPM package, call hierarchy and references from its index store (`--swift-calls`) | module, class, struct, enum, protocol, extension, function, method, property (one written over several lines, like a view's `body`) | contains, calls, refs |
+| Swift | `sourcekit-lsp` over stdio: document symbols per file; for a SwiftPM package, calls and references read from the compiler's index store through the toolchain's `libIndexStore` (`--swift-calls`) | module, class, struct, enum, protocol, extension, function, method, property (one written over several lines, like a view's `body`) | contains, calls, refs |
 
 ## Use
 
@@ -43,12 +43,13 @@ A symbol is its id (`py:path/file.py::Class.method`, `swift:Sources/App/Model.sw
 that matches exactly one symbol.
 
 Swift calls are linked for SwiftPM packages only, and only when asked (`--swift-calls`, or `Index(..., swift_calls=True)`):
-each package is built once with `swift build --enable-index-store` into the cache directory (never the package's own
-`.build`), and its edges are reused until one of its Swift files changes. A call into the SDK or anything outside the
-tree isn't an edge. Every function's references come from the same index store: where one is named inside another
-function, method or multi-line property without a `calls` edge (a call the call hierarchy didn't report, or a use as a
-value), that's a `refs` edge; a place nothing modelled encloses is listed in the answer's note. Files outside a package
-(an Xcode project's) get structure only.
+each package is built with `swift build --enable-index-store` into the cache directory (one scratch build per package,
+incremental, never the package's own `.build`), and the index store that build writes is read directly through the
+toolchain's `libIndexStore` (over `ctypes`, no language server). Each call is attributed to the innermost function,
+method or multi-line property around it (a call in a closure belongs to the function the closure is in); a function
+named without being called (`#selector(f)`, `let g = f`) is a `refs` edge; a place nothing modelled encloses is listed
+in the answer's note. A call into the SDK or anything outside the tree isn't an edge. The edges are reused until one of
+the package's Swift files changes. Files outside a package (an Xcode project's) get structure only.
 
 ### Reading an answer
 
@@ -89,8 +90,9 @@ idx.slice("py:app.py::main", radius=1, access="member")
 ## Numbers
 
 On titan-node (343 Python files): 3,891 symbols, 6,531 resolved calls and 727 `refs`, about 2 s for a cold build and
-0.2 s warm. On Jellybean's `mac/` package (269 Swift files) with `--swift-calls`: 7,186 symbols, 8,481 calls and 865
-`refs`, about 4 minutes cold (the build, then call hierarchy and references on eight servers) and 0.2 s warm.
+0.2 s warm. On Jellybean's `mac/` package (269 Swift files) with `--swift-calls`: 7,186 symbols, 9,631 calls and 130
+`refs`. A cold run is the build plus a few seconds to read the store (1 min 44 s here, with the package's scratch build
+already present); after a Swift file changes, about 15 s (an incremental build and the read); otherwise 0.2 s.
 
 ## Tests
 

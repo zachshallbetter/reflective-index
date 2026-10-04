@@ -17,11 +17,11 @@ from collections import defaultdict, deque
 from pathlib import Path
 from typing import Any, Iterable
 
-from . import python_extractor, swift_extractor
+from . import indexstore, python_extractor, swift_extractor
 
 SCHEMA = "rr-csg-0.1+ri-ext-draft"
 ACCESS_ORDER = ("public", "member", "owner", "administrator")   # reflective-rust's AccessLevel, lowest first
-FACTS_VERSION = 3   # bump when an extractor's facts change shape, so cached facts are re-read
+FACTS_VERSION = 4   # bump when an extractor's facts change shape, so cached facts are re-read
 SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", "build", "dist", ".build", "DerivedData",
              ".reflective-index"}
 MAX_FILE_BYTES = 2_000_000
@@ -52,7 +52,7 @@ class Index:
         self.unresolved_in: dict[str, int] = defaultdict(int)     # caller id → calls in it that couldn't be resolved
         self.unresolved_named: dict[str, int] = defaultdict(int)  # called name → unresolved calls by that name
         # Swift calls come from a SwiftPM package's index store, which needs a build: only when asked for, cached by
-        # the package's file hashes (swift_extractor.package_calls).
+        # the package's file hashes (indexstore.edges).
         self.swift_calls = swift_calls
         self.package_edges: dict[str, dict[str, Any]] = {}
 
@@ -106,8 +106,9 @@ class Index:
         return self
 
     def _swift_packages(self, old: dict[str, Any]) -> dict[str, dict[str, Any]]:
-        """Each SwiftPM package's call edges: reused while none of its Swift files changed, else from a fresh build of
-        its index store (in the cache directory, never the package's own .build)."""
+        """Each SwiftPM package's call and reference edges: reused while none of its Swift files changed, else read
+        from its index store after an incremental build (one scratch build per package, in the cache directory, never
+        the package's own .build)."""
         swift = [r for r in self.files if r.endswith(".swift") and "facts" in self.files[r]]
         out: dict[str, dict[str, Any]] = {}
         for pkg in swift_extractor.find_packages(str(self.root), swift):
@@ -120,15 +121,17 @@ class Index:
             if not swift_extractor.build_index(str(self.root), pkg, scratch):
                 out[pkg] = {"key": None, "edges": [], "outside": 0, "unplaced": {}, "error": "swift build failed"}
                 continue
-            functions, spans = {}, []
-            for r in mine:
-                facts = self.files[r]["facts"]
-                for n in facts["nodes"]:
-                    if n["kind"] in ("function", "method", "property"):
-                        spans.append((r, n["span"]["start_line"], n["span"]["end_line"], n["id"]))
-                        if n["id"] in facts.get("anchors", {}):
-                            functions[n["id"]] = (r, facts["anchors"][n["id"]])
-            edges, outside, unplaced = swift_extractor.package_calls(str(self.root), pkg, functions, spans, scratch)
+            store = indexstore.find_store(scratch)
+            spans = [(r, n["span"]["start_line"], n["span"]["end_line"], n["id"], n["name"])
+                     for r in mine for n in self.files[r]["facts"]["nodes"]
+                     if n["kind"] in ("function", "method", "property")]
+            try:
+                if not store:
+                    raise indexstore.IndexStoreError("the build wrote no index store")
+                edges, outside, unplaced = indexstore.edges(store, str(self.root), spans)
+            except (indexstore.IndexStoreError, OSError) as exc:
+                out[pkg] = {"key": None, "edges": [], "outside": 0, "unplaced": {}, "error": str(exc)[:200]}
+                continue
             out[pkg] = {"key": key, "edges": edges, "outside": outside, "unplaced": unplaced}
         return out
 
@@ -291,9 +294,6 @@ class Index:
                                  f"property, a one-line property, a top-level statement); read those lines.")
                 notes.append("Swift links come from the compiler's index for this package only: code in other targets "
                              "(an app, widget or extension built by Xcode) isn't seen.")
-            elif n["kind"] == "property":
-                notes.append("calls made from a property aren't traced (only from functions and methods); "
-                             "read it with read_symbol.")
             elif not self.callees(nid) and not self.referenced(nid):
                 notes.append(f"the compiler's index gave no calls for this {n['kind']}; {confirm} (read it).")
         return notes
