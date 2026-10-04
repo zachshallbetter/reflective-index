@@ -4,6 +4,7 @@ public struct Jordan {
     func step() -> Int { helper(2) }
     static func note() -> Int { 1 }
     func viaSelf() -> Int { Self.note() }
+    func pick() -> (Int) -> Int { helper }
     var total: Int {
         helper(3) + Leo.count()
     }

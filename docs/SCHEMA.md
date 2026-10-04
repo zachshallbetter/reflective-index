@@ -72,6 +72,6 @@ swift:<path>::extension <Type>       an extension (a second one in the same file
 |---|---|
 | `contains` | module → class/function, class → method, function → nested function |
 | `imports` | module → module (repository modules only) |
-| `calls` | function/method → function, method or class (construction). Swift: from a SwiftPM package's index store |
-| `refs` | function/method/property (or a module, for top-level code) → function or method it names without a resolved call: a value (`x = m.f`, `to_thread(m.f)`, a dispatch table), or in Swift a reference the call hierarchy didn't report as a call |
+| `calls` | function/method/property → function, method, property (a computed one's getter) or class (construction). Swift: from a SwiftPM package's index store |
+| `refs` | function/method/property (or a module, for top-level code) → function or method it names without a resolved call: a value (`x = m.f`, `to_thread(m.f)`, a dispatch table), or in Swift any mention the index store doesn't record as a call (`#selector(f)`, `let g = f`) |
 | `inherits` | class → base class |

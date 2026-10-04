@@ -87,13 +87,16 @@ class TestSwiftCalls(unittest.TestCase):
             self.assertNotIn(f"{p}::Leo.count()", {a for a, _ in calls}, "Array.count is the SDK's: no edge")
             self.assertEqual([n["id"] for n in idx.callers(f"{p}::Jordan.step()")], [f"{p}::Jordan.plan()"])
             self.assertIn((f"{p}::Jordan.viaSelf()", f"{p}::Jordan.note()"), calls, "a static call through Self")
-            # A computed property is a node; what it names reaches the callee as a reference, and the answer says so.
+            # A computed property is a node, and calls made in it are its calls.
             self.assertEqual(idx.nodes[f"{p}::Jordan.total"]["kind"], "property")
-            self.assertIn(f"{p}::Jordan.total", {n["id"] for n in idx.referrers(f"{p}::helper(_:)")})
+            self.assertIn((f"{p}::Jordan.total", f"{p}::helper(_:)"), calls)
+            # A function named without being called is a reference.
+            self.assertEqual({n["id"] for n in idx.referrers(f"{p}::helper(_:)")}, {f"{p}::Jordan.pick()"})
             report = idx.report(f"{p}::helper(_:)", "callers")
             self.assertIn("names it without a resolved call", report)
             self.assertIn("other targets", report)
-            self.assertIn("aren't traced", idx.report(f"{p}::Jordan.total", "callees"))
+            self.assertIn(f"{p}::helper(_:)", idx.report(f"{p}::Jordan.total", "callees"))
+            self.assertNotIn("note:", idx.report(f"{p}::Jordan.total", "callees"))
             # Unchanged files: the edges come from the cache, without another build.
             again = Index(d, cache=Path(d) / ".ri" / "c.json", swift_calls=True).build()
             self.assertEqual({(e["from"], e["to"]) for e in again.edges if e["relationship"] == "calls"}, calls)
