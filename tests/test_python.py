@@ -45,6 +45,25 @@ FILES = {
                 return load("z")
             return helper()
     ''',
+    "wire.py": '''
+        import json
+        import pkg.store as st
+        from pkg.store import load
+
+        HANDLERS = {"load": load}
+
+
+        def run(cb=None):
+            cb = cb or st.read
+            json.dumps({})
+            len([])
+            return cb("p")
+
+
+        def later(thing):
+            thing.load()
+            return defer(st.read)
+    ''',
     "broken.py": "def oops(:\n",
 }
 
@@ -85,6 +104,29 @@ class PythonIndexTest(unittest.TestCase):
         self.assertGreaterEqual(self.idx.unresolved, 1)          # unknown_call() is counted, not guessed
         callers = {n["id"] for n in self.idx.callers("py:pkg/store.py::load")}
         self.assertEqual(callers, {"py:app.py::main", "py:app.py::main.helper"})
+
+    def test_functions_used_as_values_are_refs(self):
+        rels = {(e["from"], e["to"], e["relationship"]) for e in self.idx.edges}
+        self.assertIn(("py:wire.py", "py:pkg/store.py::load", "refs"), rels)          # a dispatch table
+        self.assertIn(("py:wire.py::run", "py:pkg/store.py::read", "calls"), rels)    # a local alias, called later
+        self.assertIn(("py:wire.py::later", "py:pkg/store.py::read", "refs"), rels)   # passed as an argument
+        self.assertEqual({n["id"] for n in self.idx.referrers("py:pkg/store.py::read")}, {"py:wire.py::later"})
+        self.assertIn("py:wire.py::run", {n["id"] for n in self.idx.callers("py:pkg/store.py::read")})
+
+    def test_answers_say_when_they_may_be_short(self):
+        # cb("p") reaches st.read through the alias; json.dumps and len leave the repo and aren't gaps
+        self.assertEqual(self.idx.unresolved_in.get("py:wire.py::run", 0), 0)
+        self.assertNotIn("note:", self.idx.report("py:wire.py::run", "callees"))
+        # defer(...) and thing.load() can't be resolved
+        report = self.idx.report("py:wire.py::later", "callees")
+        self.assertIn("py:pkg/store.py::read", report)
+        self.assertIn("2 calls in this function couldn't be resolved", report)
+        self.assertIn("doesn't mean none", report)
+        self.assertNotIn("note:", self.idx.report("py:pkg/store.py::Store.get", "callees"))
+        # thing.load() might be store.load: callers of load says an unresolved call carries its name
+        callers = self.idx.report("py:pkg/store.py::load", "callers")
+        self.assertIn("1 call named `load` couldn't be resolved", callers)
+        self.assertIn("text search for `load`", callers)
 
     def test_imports_and_contains(self):
         rels = {(e["from"], e["to"], e["relationship"]) for e in self.idx.edges}

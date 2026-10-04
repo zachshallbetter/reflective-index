@@ -1,11 +1,16 @@
 """Swift facts from sourcekit-lsp, the Swift toolchain's language server, spoken to over stdio.
 
 Structure, one file at a time (`extract`), from `textDocument/documentSymbol`. It's syntactic, so a file needs no build:
-  nodes     module, class, struct, enum, protocol, extension, function, method (initializers are methods)
+  nodes     module, class, struct, enum, protocol, extension, function, method (initializers are methods), and
+            property for a property written over several lines (a computed one, like a SwiftUI view's `body`, or one
+            set by a closure): code runs in it, so calls are made from it
   contains  parent → child
 Calls, for a SwiftPM package (`package_calls`), from the package's index store (`swift build` writes it) through
 `callHierarchy/outgoingCalls`: an edge only where the index names the callee's definition in the repository. Calls into
-the SDK or anything else outside the tree aren't edges and aren't guesses.
+the SDK or anything else outside the tree aren't edges and aren't guesses. Then `textDocument/references` on every
+function and method, each place it's named attributed to the innermost function, method or property around it: a
+`refs` edge where outgoing calls had no `calls` edge (a call the call hierarchy missed, or a use as a value), and
+the place itself kept as unplaced when nothing the index models encloses it.
 
 Ids:
   swift:<path>                              the file
@@ -26,9 +31,11 @@ from typing import Any
 
 LANGUAGE = "swift"
 
-# LSP SymbolKind → node kind. Properties, enum cases and variables aren't nodes (the Python side has none either).
+# LSP SymbolKind → node kind. A one-line property, an enum case or a variable isn't a node (Python has none either);
+# a property written over several lines is (PROPERTY_KINDS), since code runs in it.
 KINDS = {5: "class", 23: "struct", 10: "enum", 11: "protocol", 3: "extension", 6: "method", 9: "method",
          12: "function"}
+PROPERTY_KINDS = {7, 13}
 TYPE_KINDS = {"class", "struct", "enum", "protocol", "extension"}
 
 
@@ -156,10 +163,12 @@ def extract(rel: str, source: str, access: str, lsp: LSP | None = None) -> dict[
         for s in syms:
             kind = KINDS.get(s.get("kind"))
             name = str(s.get("name") or "")
-            if not kind or not name:
-                continue
             start = s["range"]["start"]["line"] + 1
             end = max(start, s["range"]["end"]["line"] + 1)
+            if s.get("kind") in PROPERTY_KINDS and end > start:
+                kind = "property"
+            if not kind or not name:
+                continue
             if kind == "extension":
                 qual, member_path = f"extension {name}", name
             elif kind in TYPE_KINDS:
@@ -170,6 +179,8 @@ def extract(rel: str, source: str, access: str, lsp: LSP | None = None) -> dict[
                     kind = "function"
                 if kind == "function" and type_path:
                     kind = "method"
+            if kind == "property":
+                qual = f"{type_path}.{name}" if type_path else name
             nid = unique(f"{mod_id}::{qual}")
             nodes.append({"id": nid, "name": name if kind != "extension" else qual, "kind": kind,
                           "span": {"file": rel, "start_line": start, "end_line": end},
@@ -212,10 +223,13 @@ def build_index(root: str, package: str, scratch: str, timeout: int = 1800) -> b
 
 def package_calls(root: str, package: str, functions: dict[str, tuple[str, list[int]]],
                   spans: list[tuple[str, int, int, str]], scratch: str,
-                  ready_timeout: float = 30.0, workers: int | None = None) -> tuple[list[list[str]], int]:
-    """Call edges among this package's functions, from its index store, by several sourcekit-lsp servers at once (each
-    answers one request at a time). `functions`: node id → (file rel, name position); `spans`: (file rel, start line,
-    end line, node id) of every function and method. Returns (edges, how many calls led outside the tree)."""
+                  ready_timeout: float = 30.0, workers: int | None = None
+                  ) -> tuple[list[list[str]], int, dict[str, list[list[Any]]]]:
+    """Call and reference edges among this package's functions, from its index store, by several sourcekit-lsp servers
+    at once (each answers one request at a time). `functions`: node id → (file rel, name position); `spans`: (file rel,
+    start line, end line, node id) of every function, method and property. Returns (edges, how many calls led outside
+    the tree, unplaced: target id → [[file rel, line], …] for places it's named that no function, method or property
+    encloses)."""
     from concurrent.futures import ThreadPoolExecutor
     # Whole files to each server: opening a file makes its server type-check it, so a file shouldn't be opened by all.
     by_file: dict[str, dict[str, tuple[str, list[int]]]] = {}
@@ -227,16 +241,18 @@ def package_calls(root: str, package: str, functions: dict[str, tuple[str, list[
         min(chunks, key=len).update(fns)
     with ThreadPoolExecutor(max_workers=n) as pool:
         results = list(pool.map(lambda c: _package_calls_one(root, package, c, spans, scratch, ready_timeout), chunks))
-    edges = [e for r in results for e in r[0]]
-    return edges, sum(r[1] for r in results)
+    calls = {(a, b) for r in results for a, b, rel in r[0] if rel == "calls"}
+    edges = [e for r in results for e in r[0] if e[2] == "calls" or (e[0], e[1]) not in calls]
+    unplaced: dict[str, list[list[Any]]] = {}
+    for r in results:
+        unplaced.update(r[2])
+    return edges, sum(r[1] for r in results), unplaced
 
 
 def _package_calls_one(root: str, package: str, functions: dict[str, tuple[str, list[int]]],
-                  spans: list[tuple[str, int, int, str]], scratch: str,
-                  ready_timeout: float = 30.0) -> tuple[list[list[str]], int]:
-    """Call edges among this package's functions, from its index store. `functions`: node id → (file rel, anchor);
-    `spans`: (file rel, start line, end line, node id) of every function and method, innermost-first resolution.
-    Returns (edges, how many calls led outside the tree)."""
+                       spans: list[tuple[str, int, int, str]], scratch: str,
+                       ready_timeout: float = 30.0) -> tuple[list[list[str]], int, dict[str, list[list[Any]]]]:
+    """One server's share of package_calls: outgoing calls and references for these functions."""
     by_file: dict[str, list[tuple[int, int, str]]] = {}
     for f, s, e, nid in spans:
         by_file.setdefault(f, []).append((s, e, nid))
@@ -251,61 +267,92 @@ def _package_calls_one(root: str, package: str, functions: dict[str, tuple[str, 
     lsp = LSP(os.path.join(root, package), ["--scratch-path", scratch])
     edges: list[list[str]] = []
     outside = 0
+    unplaced: dict[str, list[list[Any]]] = {}
     opened: set[str] = set()
     root_abs = os.path.abspath(root)
 
     def open_file(path: str) -> str:
         uri = "file://" + path
         if uri not in opened:
-            text = open(path, encoding="utf-8", errors="replace").read()
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                text = fh.read()
             lsp.notify("textDocument/didOpen", {"textDocument": {"uri": uri, "languageId": "swift", "version": 1,
                                                                 "text": text}})
             opened.add(uri)
         return uri
 
+    def in_tree(uri: str) -> str | None:
+        path = str(uri)[len("file://"):]
+        return os.path.relpath(path, root_abs) if path.startswith(root_abs + os.sep) else None
+
+    def outgoing(nid: str, rel: str, line: int, ch: int) -> tuple[list[list[str]], int] | None:
+        """This function's call edges and how many calls led outside the tree, or None when the server had nothing
+        for it (not loaded yet, or no calls)."""
+        try:
+            uri = open_file(os.path.join(root_abs, rel))
+            items = lsp.request("textDocument/prepareCallHierarchy",
+                                {"textDocument": {"uri": uri}, "position": {"line": line, "character": ch}}) or []
+            out = (lsp.request("callHierarchy/outgoingCalls", {"item": items[0]}) or []) if items else []
+        except (LSPError, OSError):
+            return None
+        if not out:
+            return None
+        found, away = [], 0
+        for call in out:
+            to = call.get("to") or {}
+            trel = in_tree(to.get("uri", ""))
+            tline = (to.get("selectionRange") or to.get("range") or {}).get("start", {}).get("line", -1) + 1
+            tnid = target(trel, tline) if trel else None
+            if tnid and tnid != nid:
+                found.append([nid, tnid, "calls"])
+            elif not tnid:
+                away += 1
+        return found, away
+
     try:
-        # The server loads the package and its index store in the background after it starts: until it has, call
-        # hierarchy answers nothing. Wait (up to ready_timeout) until the first function resolves.
+        # The server loads the package and its index store in the background after it starts, and until it has, call
+        # hierarchy answers nothing (or an item with no calls). Wait (up to ready_timeout) until one of the first
+        # functions answers with calls; whatever still comes back empty is asked again at the end, once loaded.
         import time
         deadline = time.monotonic() + ready_timeout
-        first = next(iter(functions.items()), None)
-        while first and time.monotonic() < deadline:
-            rel0, (line0, ch0) = first[1]
-            try:
-                if lsp.request("textDocument/prepareCallHierarchy",
-                               {"textDocument": {"uri": open_file(os.path.join(root_abs, rel0))},
-                                "position": {"line": line0, "character": ch0}}):
-                    break
-            except (LSPError, OSError):
-                pass
+        probe = list(functions.items())[:20]
+        while probe and time.monotonic() < deadline:
+            if any(outgoing(nid, rel, line, ch) is not None for nid, (rel, (line, ch)) in probe):
+                break
             time.sleep(0.5)
+        empty = []
+        for nid, (rel, (line, ch)) in functions.items():
+            got = outgoing(nid, rel, line, ch)
+            if got is None:
+                empty.append(nid)
+            else:
+                edges += got[0]
+                outside += got[1]
+        for nid in empty:
+            rel, (line, ch) = functions[nid]
+            got = outgoing(nid, rel, line, ch)
+            if got:
+                edges += got[0]
+                outside += got[1]
+        # Every place each function is named, attributed to what encloses it.
         for nid, (rel, (line, ch)) in functions.items():
             try:
-                uri = open_file(os.path.join(root_abs, rel))
-            except OSError:
+                refs = lsp.request("textDocument/references",
+                                   {"textDocument": {"uri": open_file(os.path.join(root_abs, rel))},
+                                    "position": {"line": line, "character": ch},
+                                    "context": {"includeDeclaration": False}}) or []
+            except (LSPError, OSError):
                 continue
-            try:
-                items = lsp.request("textDocument/prepareCallHierarchy",
-                                    {"textDocument": {"uri": uri}, "position": {"line": line, "character": ch}}) or []
-            except LSPError:
-                continue
-            for item in items[:1]:
-                try:
-                    out = lsp.request("callHierarchy/outgoingCalls", {"item": item}) or []
-                except LSPError:
+            for r in refs:
+                rrel = in_tree(r.get("uri", ""))
+                if not rrel:
                     continue
-                for call in out:
-                    to = call.get("to") or {}
-                    tpath = str(to.get("uri", ""))[len("file://"):]
-                    if not tpath.startswith(root_abs + os.sep):
-                        outside += 1
-                        continue
-                    trel = os.path.relpath(tpath, root_abs)
-                    tnid = target(trel, (to.get("selectionRange") or to.get("range") or {}).get("start", {}).get("line", -1) + 1)
-                    if tnid and tnid != nid:
-                        edges.append([nid, tnid, "calls"])
-                    elif not tnid:
-                        outside += 1
+                rline = r["range"]["start"]["line"] + 1
+                src = target(rrel, rline)
+                if src is None:
+                    unplaced.setdefault(nid, []).append([rrel, rline])
+                elif src != nid:
+                    edges.append([src, nid, "refs"])
     finally:
         lsp.close()
-    return edges, outside
+    return edges, outside, unplaced

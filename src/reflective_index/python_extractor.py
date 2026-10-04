@@ -6,6 +6,11 @@ What it records per file:
   imports       local alias → dotted module           (`import m`, `import m as x`)
   from_imports  local name → (dotted module, name)    (`from m import f as g`)
   calls         (caller id, descriptor): a bare name `f()`, or `base.attr()` with a plain-name base
+                a local name bound to a function and then called (`f = f or m.g; f()`) is a call to it, with "via"
+  refs          (caller id, descriptor): a function named but not called there, so used as a value: `x = m.f`,
+                `to_thread(m.f, a)`, `{"k": f}`. Only names that could be a def (this module's top-level defs, from-imports,
+                imported modules' attributes, self/cls attributes); the module itself is the caller at top level.
+  unresolved_in (caller id → count) is computed when linking, not here
 Resolution of imports and calls happens in graph.Index once every file is known.
 """
 from __future__ import annotations
@@ -38,6 +43,7 @@ def extract(rel: str, source: str, access: str) -> dict[str, Any]:
     imports: dict[str, str] = {}
     from_imports: dict[str, list[str]] = {}
     calls: list[list[Any]] = []
+    refs: list[list[Any]] = []
 
     def start(n: ast.AST) -> int:
         decs = getattr(n, "decorator_list", None) or []
@@ -60,29 +66,75 @@ def extract(rel: str, source: str, access: str) -> dict[str, Any]:
             return {"base": f.value.id, "attr": f.attr}
         return None
 
-    def own_calls(fn: ast.AST) -> list[ast.Call]:
-        """Calls in this function's body, not in functions or classes nested inside it (those are their own nodes)."""
-        out, stack = [], list(ast.iter_child_nodes(fn))
+    def own_nodes(roots: list[ast.AST]) -> list[ast.AST]:
+        """Everything under these, not in functions or classes nested inside (those are their own nodes); a lambda's
+        body belongs to the function it's written in."""
+        out, stack = [], list(roots)
         while stack:
             n = stack.pop()
-            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)) and n is not fn:
-                if isinstance(n, ast.Lambda):
-                    stack.extend(ast.iter_child_nodes(n))
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 continue
-            if isinstance(n, ast.Call):
-                out.append(n)
+            out.append(n)
             stack.extend(ast.iter_child_nodes(n))
         return out
+
+    # names a value reference could resolve through (anything else can't be a def in the repo)
+    top_defs: set[str] = set()
+
+    def collect_defs(body: list[ast.stmt]) -> None:
+        for n in body:
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                top_defs.add(n.name)
+            elif isinstance(n, (ast.If, ast.Try, ast.With, ast.AsyncWith, ast.For, ast.While)):
+                for part in ("body", "orelse", "finalbody"):
+                    collect_defs(getattr(n, part, []) or [])
+                for h in getattr(n, "handlers", []) or []:
+                    collect_defs(h.body)
+
+    def ref_desc(n: ast.AST, cls: str | None) -> dict[str, Any] | None:
+        """A name that could be a def in the repo, as a call descriptor, or None."""
+        if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and (
+                n.value.id in imports or (cls and n.value.id in ("self", "cls"))):
+            return {"base": n.value.id, "attr": n.attr, "cls": cls}
+        if isinstance(n, ast.Name) and (n.id in top_defs or n.id in from_imports):
+            return {"name": n.id}
+        return None
+
+    def record(nid: str, roots: list[ast.AST], cls: str | None) -> None:
+        """This scope's calls, and the functions it names without calling (used as values)."""
+        found = own_nodes(roots)
+        called = {id(c.func) for c in found if isinstance(c, ast.Call)}
+        # A local name bound to a function and then called is a call to that function: `f = f or m.g; f(x)` calls
+        # m.g wherever the default is what runs (a caller can still pass its own).
+        aliases: dict[str, list[dict[str, Any]]] = {}
+        for n in found:
+            if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name):
+                vals = n.value.values if isinstance(n.value, ast.BoolOp) else (
+                    [n.value.body, n.value.orelse] if isinstance(n.value, ast.IfExp) else [n.value])
+                for v in vals:
+                    d = ref_desc(v, cls)
+                    if d:
+                        aliases.setdefault(n.targets[0].id, []).append(d)
+        for n in found:
+            if isinstance(n, ast.Call):
+                d = call_desc(n)
+                if d and d.get("name") in aliases and d["name"] not in top_defs and d["name"] not in from_imports:
+                    for a in aliases[d["name"]]:
+                        calls.append([nid, {**a, "via": d["name"], "line": n.lineno}])
+                elif d:
+                    calls.append([nid, {**d, "cls": cls, "line": n.lineno}])
+            elif id(n) in called or not isinstance(getattr(n, "ctx", None), ast.Load):
+                continue
+            elif (d := ref_desc(n, cls)) is not None:
+                refs.append([nid, {**d, "line": n.lineno}])
 
     def visit(body: list[ast.stmt], prefix: str, parent: str, cls: str | None) -> None:
         for n in body:
             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 qual = f"{prefix}{n.name}"
                 nid = add(n, qual, "method" if cls else "function", parent)
-                for c in own_calls(n):
-                    d = call_desc(c)
-                    if d:
-                        calls.append([nid, {**d, "cls": cls, "line": c.lineno}])
+                # the body and the defaults, not the decorators (those run once, at definition)
+                record(nid, list(n.body) + list(n.args.defaults) + [d for d in n.args.kw_defaults if d], cls)
                 visit(n.body, f"{qual}.", nid, None)
             elif isinstance(n, ast.ClassDef):
                 qual = f"{prefix}{n.name}"
@@ -99,6 +151,9 @@ def extract(rel: str, source: str, access: str) -> dict[str, Any]:
                     visit(getattr(n, part, []) or [], prefix, parent, cls)
                 for h in getattr(n, "handlers", []) or []:
                     visit(h.body, prefix, parent, cls)
+            elif parent == mod_id and not isinstance(n, (ast.Import, ast.ImportFrom)):
+                # module level: dispatch tables and registrations (`TOOLS = {"x": run_x}`) name functions here
+                record(mod_id, [n], None)
 
     # imports anywhere in the file (function-local `import x` inside a branch binds too)
     for n in ast.walk(tree):
@@ -109,6 +164,7 @@ def extract(rel: str, source: str, access: str) -> dict[str, Any]:
             for a in n.names:
                 if a.name != "*":
                     from_imports.setdefault(a.asname or a.name, [n.module, a.name])
+    collect_defs(tree.body)
     visit(tree.body, "", mod_id, None)
     return {"language": LANGUAGE, "nodes": nodes, "contains": contains, "imports": imports,
-            "from_imports": from_imports, "calls": calls}
+            "from_imports": from_imports, "calls": calls, "refs": refs}

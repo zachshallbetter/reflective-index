@@ -3,8 +3,8 @@
   stats                    files, nodes and edges by kind, unresolved calls
   outline FILE             a file's classes, functions and methods with line ranges
   find NAME                symbols by name (exact, else substring)
-  callers SYMBOL           who calls it
-  callees SYMBOL           what it calls
+  callers SYMBOL           who calls it, what names it without a resolved call, and why the list may be short
+  callees SYMBOL           what it calls, the same way
   read SYMBOL              its source, line-numbered
   slice SYMBOL [RADIUS]    it and its neighbourhood, with edges (JSON)
   csg                      the whole graph (JSON)
@@ -52,7 +52,7 @@ def main(argv: list[str] | None = None) -> int:
         elif cmd == "slice":
             print(json.dumps(idx.slice(n["id"], int(args[1]) if len(args) > 1 else 1), indent=1))
         else:
-            print("\n".join(brief(x) for x in getattr(idx, cmd)(n["id"])))
+            print(idx.report(n["id"], cmd, brief))
     else:
         print(__doc__, file=sys.stderr)
         return 2
