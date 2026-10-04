@@ -2,11 +2,14 @@
 
 Calls are linked only where the binding is certain: a def in the same module, `from m import f`,
 `import m as x; x.f()`, `self.f()` / `cls.f()` inside a class, and `Class()` to the class. Everything else
-is counted as unresolved, never guessed. The per-file facts are cached by content hash, so a rebuild
+is counted as unresolved, never guessed, and the count is kept per caller and per called name so an answer can say
+when it may be short. A function named without being called (`x = m.f`, `to_thread(m.f, a)`) is a `refs` edge,
+resolved the same way. The per-file facts are cached by content hash, so a rebuild
 re-reads only what changed.
 """
 from __future__ import annotations
 
+import builtins
 import hashlib
 import json
 import os
@@ -18,6 +21,7 @@ from . import python_extractor, swift_extractor
 
 SCHEMA = "rr-csg-0.1+ri-ext-draft"
 ACCESS_ORDER = ("public", "member", "owner", "administrator")   # reflective-rust's AccessLevel, lowest first
+FACTS_VERSION = 2   # bump when an extractor's facts change shape, so cached facts are re-read
 SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", "build", "dist", ".build", "DerivedData",
              ".reflective-index"}
 MAX_FILE_BYTES = 2_000_000
@@ -45,6 +49,8 @@ class Index:
         self.nodes: dict[str, dict[str, Any]] = {}
         self.edges: list[dict[str, Any]] = []
         self.unresolved = 0
+        self.unresolved_in: dict[str, int] = defaultdict(int)     # caller id → calls in it that couldn't be resolved
+        self.unresolved_named: dict[str, int] = defaultdict(int)  # called name → unresolved calls by that name
         # Swift calls come from a SwiftPM package's index store, which needs a build: only when asked for, cached by
         # the package's file hashes (swift_extractor.package_calls).
         self.swift_calls = swift_calls
@@ -65,7 +71,8 @@ class Index:
         old_pkg: dict[str, Any] = {}
         try:
             cached = json.loads(self.cache_path.read_text())
-            if cached.get("schema") == SCHEMA and cached.get("access") == self.access:
+            if (cached.get("schema") == SCHEMA and cached.get("access") == self.access
+                    and cached.get("facts_version") == FACTS_VERSION):
                 old = cached.get("files", {})
                 old_pkg = cached.get("swift_calls", {})
         except (OSError, ValueError):
@@ -91,7 +98,8 @@ class Index:
         self._link()
         try:
             self.cache_path.parent.mkdir(parents=True, exist_ok=True)
-            self.cache_path.write_text(json.dumps({"schema": SCHEMA, "access": self.access, "files": self.files,
+            self.cache_path.write_text(json.dumps({"schema": SCHEMA, "facts_version": FACTS_VERSION,
+                                                   "access": self.access, "files": self.files,
                                                    "swift_calls": self.package_edges}))
         except OSError:
             pass
@@ -104,24 +112,24 @@ class Index:
         out: dict[str, dict[str, Any]] = {}
         for pkg in swift_extractor.find_packages(str(self.root), swift):
             mine = sorted(r for r in swift if pkg == "" or r.startswith(pkg + os.sep))
-            key = _sha("".join(self.files[r]["hash"] for r in mine).encode())
+            key = _sha((f"v{FACTS_VERSION}" + "".join(self.files[r]["hash"] for r in mine)).encode())
             if old.get(pkg, {}).get("key") == key:
                 out[pkg] = old[pkg]
                 continue
             scratch = str(self.cache_path.parent / "swiftpm" / (pkg.replace(os.sep, "_") or "root"))
             if not swift_extractor.build_index(str(self.root), pkg, scratch):
-                out[pkg] = {"key": None, "edges": [], "outside": 0, "error": "swift build failed"}
+                out[pkg] = {"key": None, "edges": [], "outside": 0, "unplaced": {}, "error": "swift build failed"}
                 continue
             functions, spans = {}, []
             for r in mine:
                 facts = self.files[r]["facts"]
                 for n in facts["nodes"]:
-                    if n["kind"] in ("function", "method"):
+                    if n["kind"] in ("function", "method", "property"):
                         spans.append((r, n["span"]["start_line"], n["span"]["end_line"], n["id"]))
                         if n["id"] in facts.get("anchors", {}):
                             functions[n["id"]] = (r, facts["anchors"][n["id"]])
-            edges, outside = swift_extractor.package_calls(str(self.root), pkg, functions, spans, scratch)
-            out[pkg] = {"key": key, "edges": edges, "outside": outside}
+            edges, outside, unplaced = swift_extractor.package_calls(str(self.root), pkg, functions, spans, scratch)
+            out[pkg] = {"key": key, "edges": edges, "outside": outside, "unplaced": unplaced}
         return out
 
     def _resolve_module(self, dotted: str, importer: str) -> str | None:
@@ -136,6 +144,8 @@ class Index:
 
     def _link(self) -> None:
         self.nodes, self.edges, self.unresolved = {}, [], 0
+        self.unresolved_in, self.unresolved_named = defaultdict(int), defaultdict(int)
+        self.unplaced: dict[str, list[list[Any]]] = {}
         for f in self.files.values():
             for n in f.get("facts", {}).get("nodes", []):
                 self.nodes[n["id"]] = n
@@ -165,22 +175,42 @@ class Index:
                 if target:
                     from_map[local] = f"py:{target}::{name}"
                     edge(mod, f"py:{target}", "imports")
-            for caller, d in facts["calls"]:
-                target = None
+            def resolve(d: dict[str, Any]) -> str | None:
                 if "name" in d:
                     nm = d["name"]
-                    target = f"{mod}::{nm}" if f"{mod}::{nm}" in self.nodes else from_map.get(nm)
-                elif d["base"] in ("self", "cls") and d.get("cls"):
-                    target = f"{mod}::{d['cls']}.{d['attr']}"
-                elif d["base"] in alias_mod:
-                    target = f"py:{alias_mod[d['base']]}::{d['attr']}"
+                    return f"{mod}::{nm}" if f"{mod}::{nm}" in self.nodes else from_map.get(nm)
+                if d["base"] in ("self", "cls") and d.get("cls"):
+                    return f"{mod}::{d['cls']}.{d['attr']}"
+                if d["base"] in alias_mod:
+                    return f"py:{alias_mod[d['base']]}::{d['attr']}"
+                return None
+
+            def outside(d: dict[str, Any]) -> bool:
+                """Known to leave the repo: a builtin, or something from a module that isn't in it (the standard library,
+                a package). Not a gap in the answer, so not counted as one."""
+                if "name" in d:
+                    nm = d["name"]
+                    return (nm in facts["from_imports"] and nm not in from_map) or (
+                        nm not in facts["from_imports"] and hasattr(builtins, nm))
+                return d["base"] in facts["imports"] and d["base"] not in alias_mod
+
+            for caller, d in facts["calls"]:
+                target = resolve(d)
                 if target and target in self.nodes:
                     edge(caller, target, d.get("rel", "calls"))
-                else:
+                elif not outside(d):
                     self.unresolved += 1
+                    if d.get("rel", "calls") == "calls":
+                        self.unresolved_in[caller] += 1
+                        self.unresolved_named[d.get("name") or d.get("attr")] += 1
+            for caller, d in facts.get("refs", []):
+                target = resolve(d)
+                if target and self.nodes.get(target, {}).get("kind") in ("function", "method") and target != caller:
+                    edge(caller, target, "refs")
         for pkg in self.package_edges.values():   # Swift: already resolved by the index store
             for a, b, r in pkg.get("edges", []):
                 edge(a, b, r)
+            self.unplaced.update(pkg.get("unplaced", {}))
 
     # ── queries ───────────────────────────────────────────────────────────────────────────────────
     def visible(self, n: dict[str, Any], access: str | None = None) -> bool:
@@ -214,6 +244,66 @@ class Index:
 
     def callees(self, nid: str) -> list[dict[str, Any]]:
         return self._related(nid, "calls", False)
+
+    def referrers(self, nid: str) -> list[dict[str, Any]]:
+        """What names this function without a resolved call to it: a use as a value, or a call the index saw only as
+        a reference."""
+        called = {n["id"] for n in self.callers(nid)}
+        return [n for n in self._related(nid, "refs", True) if n["id"] not in called]
+
+    def referenced(self, nid: str) -> list[dict[str, Any]]:
+        called = {n["id"] for n in self.callees(nid)}
+        return [n for n in self._related(nid, "refs", False) if n["id"] not in called]
+
+    def gaps(self, nid: str, which: str) -> list[str]:
+        """Why a callers or callees answer may be short. An empty list from the index means nothing about the code
+        unless this says it's complete, so every known gap is spelled out."""
+        n = self.nodes[nid]
+        notes: list[str] = []
+        confirm = "an empty or short list doesn't mean none"
+        if nid.startswith("py:"):
+            if which == "callers":
+                k = self.unresolved_named.get(n["name"], 0)
+                if k:
+                    notes.append(f"{k} call{'s' if k != 1 else ''} named `{n['name']}` couldn't be resolved to a definition, "
+                                 f"so {confirm} (confirm with a text search for `{n['name']}`).")
+            else:
+                k = self.unresolved_in.get(nid, 0)
+                if k:
+                    notes.append(f"{k} call{'s' if k != 1 else ''} in this {n['kind']} couldn't be resolved (a local name, "
+                                 f"a parameter, a method on an object); {confirm} (read it with read_symbol).")
+        elif nid.startswith("swift:"):
+            if not self.package_edges:
+                notes.append("Swift calls weren't indexed (build with --swift-calls); the list is empty for that reason.")
+            elif which == "callers":
+                places = self.unplaced.get(nid, [])
+                if places:
+                    where = ", ".join(f"{f}:{ln}" for f, ln in places[:8]) + (" …" if len(places) > 8 else "")
+                    notes.append(f"also named at {where}, inside code the index doesn't model (a closure in a stored "
+                                 f"property, a one-line property, a top-level statement); read those lines.")
+                notes.append("Swift links come from the compiler's index for this package only: code in other targets "
+                             "(an app, widget or extension built by Xcode) isn't seen.")
+            elif n["kind"] == "property":
+                notes.append("calls made from a property aren't traced (only from functions and methods); "
+                             "read it with read_symbol.")
+            elif not self.callees(nid) and not self.referenced(nid):
+                notes.append(f"the compiler's index gave no calls for this {n['kind']}; {confirm} (read it).")
+        return notes
+
+    def report(self, nid: str, which: str, fmt: Any = None) -> str:
+        """callers or callees as text for an agent: the resolved ones, then what names it without a resolved call,
+        then why the answer may be short."""
+        fmt = fmt or (lambda x: x["id"])
+        calls = self.callers(nid) if which == "callers" else self.callees(nid)
+        refs = self.referrers(nid) if which == "callers" else self.referenced(nid)
+        out = [fmt(x) for x in calls] or [f"no resolved {which}"]
+        if refs:
+            out.append("names it without a resolved call (a use as a value, or a call seen only as a reference):"
+                       if which == "callers" else
+                       "names without a resolved call (used as a value, or called through a local name):")
+            out += ["  " + fmt(x) for x in refs]
+        out += ["note: " + g for g in self.gaps(nid, which)]
+        return "\n".join(out)
 
     def read(self, nid: str, numbered: bool = True) -> str:
         n = self.nodes[nid]
@@ -285,7 +375,8 @@ class Index:
             rels[e["relationship"]] += 1
         return {"root": str(self.root), "files": len(self.files),
                 "unparsed": sorted(r for r, f in self.files.items() if "error" in f),
-                "nodes": dict(kinds), "edges": dict(rels), "unresolved_calls": self.unresolved}
+                "nodes": dict(kinds), "edges": dict(rels), "unresolved_calls": self.unresolved,
+                "unplaced_references": sum(len(v) for v in self.unplaced.values())}
 
     def csg(self) -> dict[str, Any]:
         """The whole graph in reflective-rust's exchange shape (see docs/SCHEMA.md for the draft extensions)."""

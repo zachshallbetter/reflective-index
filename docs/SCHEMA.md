@@ -29,6 +29,7 @@ edge   { from, to, relationship, minimum_access }
 | `enum` | a Swift enum |
 | `protocol` | a Swift protocol |
 | `extension` | a Swift extension; the members it declares belong to the extended type |
+| `property` | a Swift property written over several lines (computed, like a SwiftUI `body`, or set by a closure): code runs in it |
 
 `module` and `function` keep their rr-csg meaning.
 
@@ -61,6 +62,7 @@ swift:<path>                         a file
 swift:<path>::<Type>                 a type (nested: Outer.Inner)
 swift:<path>::<Type>.<member>        a method or initializer, with its argument labels: Model.load(from:), Model.init()
 swift:<path>::<function>             a top-level function
+swift:<path>::<Type>.<property>      a multi-line property: View.body
 swift:<path>::extension <Type>       an extension (a second one in the same file: extension <Type> #2)
 ```
 
@@ -71,4 +73,5 @@ swift:<path>::extension <Type>       an extension (a second one in the same file
 | `contains` | module → class/function, class → method, function → nested function |
 | `imports` | module → module (repository modules only) |
 | `calls` | function/method → function, method or class (construction). Swift: from a SwiftPM package's index store |
+| `refs` | function/method/property (or a module, for top-level code) → function or method it names without a resolved call: a value (`x = m.f`, `to_thread(m.f)`, a dispatch table), or in Swift a reference the call hierarchy didn't report as a call |
 | `inherits` | class → base class |

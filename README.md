@@ -12,16 +12,18 @@ same access-aware slicing works on it. The extensions it needs beyond Rust (clas
 - **Local.** It reads files on this machine. Nothing is sent anywhere.
 - **No dependencies.** The Python standard library only (Python 3.10+). Swift uses the toolchain's own
   `sourcekit-lsp` (with Xcode or a Swift toolchain installed); without it, Swift files are listed as unparsed.
-- **Certain or silent.** A call is linked only when its target can be resolved for sure. The rest are counted
-  as unresolved, never guessed.
+- **Certain, and says when it isn't complete.** A call is linked only when its target can be resolved for sure. The
+  rest are counted as unresolved, never guessed, and a `callers` or `callees` answer ends with a note when such a gap
+  could make it short, so an empty list is never mistaken for "none". A function named without being called (`x = m.f`,
+  `to_thread(m.f, a)`, a dispatch table) is a `refs` edge, listed after the calls.
 - **Incremental.** Per-file facts are cached by content hash, so a rebuild only re-reads what changed.
 
 ## Languages
 
 | Language | Extractor | Nodes | Edges |
 |---|---|---|---|
-| Python | standard library `ast` | module, class, function, method | contains, imports, calls, inherits |
-| Swift | `sourcekit-lsp` over stdio: document symbols per file; for a SwiftPM package, call hierarchy from its index store (`--swift-calls`) | module, class, struct, enum, protocol, extension, function, method | contains, calls |
+| Python | standard library `ast` | module, class, function, method | contains, imports, calls, refs, inherits |
+| Swift | `sourcekit-lsp` over stdio: document symbols per file; for a SwiftPM package, call hierarchy and references from its index store (`--swift-calls`) | module, class, struct, enum, protocol, extension, function, method, property (one written over several lines, like a view's `body`) | contains, calls, refs |
 
 ## Use
 
@@ -43,7 +45,23 @@ that matches exactly one symbol.
 Swift calls are linked for SwiftPM packages only, and only when asked (`--swift-calls`, or `Index(..., swift_calls=True)`):
 each package is built once with `swift build --enable-index-store` into the cache directory (never the package's own
 `.build`), and its edges are reused until one of its Swift files changes. A call into the SDK or anything outside the
-tree isn't an edge. Files outside a package (an Xcode project's) get structure only.
+tree isn't an edge. Every function's references come from the same index store: where one is named inside another
+function, method or multi-line property without a `calls` edge (a call the call hierarchy didn't report, or a use as a
+value), that's a `refs` edge; a place nothing modelled encloses is listed in the answer's note. Files outside a package
+(an Xcode project's) get structure only.
+
+### Reading an answer
+
+```text
+$ reflective-index ROOT callees 'py:scripts/tv_unlock.py::answer'
+function py:scripts/tv_unlock.py::_db  (scripts/tv_unlock.py:46-56)
+…
+names without a resolved call (used as a value, or called through a local name):
+  function py:scripts/proactive.py::add_card  (scripts/proactive.py:194-250)
+note: 11 calls in this function couldn't be resolved (a local name, a parameter, a method on an object); an empty or short list doesn't mean none (read it with read_symbol).
+```
+
+Calls into a builtin or a module outside the repository aren't gaps, so they aren't counted.
 
 ### As an MCP server
 
@@ -67,8 +85,9 @@ idx.slice("py:app.py::main", radius=1, access="member")
 
 ## Numbers
 
-On titan-node (342 Python files): 3,874 symbols, 4,784 resolved calls, about 6 s for a cold build and
-0.4 s warm.
+On titan-node (343 Python files): 3,891 symbols, 6,531 resolved calls and 727 `refs`, about 2 s for a cold build and
+0.2 s warm. On Jellybean's `mac/` package (269 Swift files) with `--swift-calls`: 7,186 symbols, 8,481 calls and 865
+`refs`, about 4 minutes cold (the build, then call hierarchy and references on eight servers) and 0.2 s warm.
 
 ## Tests
 

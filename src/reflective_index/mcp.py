@@ -26,9 +26,14 @@ TOOLS: list[dict[str, Any]] = [
                      "required": ["file"]}},
     {"name": "find", "description": "Symbols by name: exact matches, else substring matches on the id.",
      "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}},
-    {"name": "callers", "description": "Every function or method whose call to this symbol could be resolved with certainty.",
+    {"name": "callers", "description": "Functions and methods whose call to this symbol was resolved with certainty, then the ones "
+                                       "that name it without a resolved call (passed or stored as a value), then notes on why the "
+                                       "list may be short. Calls the index couldn't resolve aren't listed: an empty or short answer "
+                                       "doesn't mean there are none unless no note says so; confirm with a text search.",
      "inputSchema": {"type": "object", "properties": {"symbol": _SYM}, "required": ["symbol"]}},
-    {"name": "callees", "description": "What this function or method calls, where the target could be resolved with certainty.",
+    {"name": "callees", "description": "What this function or method calls, where the target was resolved with certainty, then the "
+                                       "functions it names without calling (often called later through a local name), then notes "
+                                       "on calls it couldn't resolve. An empty or short answer doesn't mean none; read the symbol.",
      "inputSchema": {"type": "object", "properties": {"symbol": _SYM}, "required": ["symbol"]}},
     {"name": "read_symbol", "description": "One symbol's source, line-numbered: a single function instead of the whole file.",
      "inputSchema": {"type": "object", "properties": {"symbol": _SYM}, "required": ["symbol"]}},
@@ -68,7 +73,7 @@ class Server:
             return "\n".join(brief(n) for n in idx.find(args["name"])) or "no matches"
         if name in ("callers", "callees"):
             n = self._sym(args["symbol"])
-            return "\n".join(brief(x) for x in getattr(idx, name)(n["id"])) or f"no resolved {name}"
+            return idx.report(n["id"], name, brief)
         if name == "read_symbol":
             return idx.read(self._sym(args["symbol"])["id"])
         if name == "slice":
