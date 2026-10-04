@@ -6,6 +6,7 @@ What it records per file:
   imports       local alias → dotted module           (`import m`, `import m as x`)
   from_imports  local name → (dotted module, name)    (`from m import f as g`)
   calls         (caller id, descriptor): a bare name `f()`, or `base.attr()` with a plain-name base
+                a local name bound to a function and then called (`f = f or m.g; f()`) is a call to it, with "via"
   refs          (caller id, descriptor): a function named but not called there, so used as a value: `x = m.f`,
                 `to_thread(m.f, a)`, `{"k": f}`. Only names that could be a def (this module's top-level defs, from-imports,
                 imported modules' attributes, self/cls attributes); the module itself is the caller at top level.
@@ -90,22 +91,42 @@ def extract(rel: str, source: str, access: str) -> dict[str, Any]:
                 for h in getattr(n, "handlers", []) or []:
                     collect_defs(h.body)
 
+    def ref_desc(n: ast.AST, cls: str | None) -> dict[str, Any] | None:
+        """A name that could be a def in the repo, as a call descriptor, or None."""
+        if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and (
+                n.value.id in imports or (cls and n.value.id in ("self", "cls"))):
+            return {"base": n.value.id, "attr": n.attr, "cls": cls}
+        if isinstance(n, ast.Name) and (n.id in top_defs or n.id in from_imports):
+            return {"name": n.id}
+        return None
+
     def record(nid: str, roots: list[ast.AST], cls: str | None) -> None:
         """This scope's calls, and the functions it names without calling (used as values)."""
         found = own_nodes(roots)
         called = {id(c.func) for c in found if isinstance(c, ast.Call)}
+        # A local name bound to a function and then called is a call to that function: `f = f or m.g; f(x)` calls
+        # m.g wherever the default is what runs (a caller can still pass its own).
+        aliases: dict[str, list[dict[str, Any]]] = {}
+        for n in found:
+            if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name):
+                vals = n.value.values if isinstance(n.value, ast.BoolOp) else (
+                    [n.value.body, n.value.orelse] if isinstance(n.value, ast.IfExp) else [n.value])
+                for v in vals:
+                    d = ref_desc(v, cls)
+                    if d:
+                        aliases.setdefault(n.targets[0].id, []).append(d)
         for n in found:
             if isinstance(n, ast.Call):
                 d = call_desc(n)
-                if d:
+                if d and d.get("name") in aliases and d["name"] not in top_defs and d["name"] not in from_imports:
+                    for a in aliases[d["name"]]:
+                        calls.append([nid, {**a, "via": d["name"], "line": n.lineno}])
+                elif d:
                     calls.append([nid, {**d, "cls": cls, "line": n.lineno}])
             elif id(n) in called or not isinstance(getattr(n, "ctx", None), ast.Load):
                 continue
-            elif isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and (
-                    n.value.id in imports or (cls and n.value.id in ("self", "cls"))):
-                refs.append([nid, {"base": n.value.id, "attr": n.attr, "cls": cls, "line": n.lineno}])
-            elif isinstance(n, ast.Name) and (n.id in top_defs or n.id in from_imports):
-                refs.append([nid, {"name": n.id, "line": n.lineno}])
+            elif (d := ref_desc(n, cls)) is not None:
+                refs.append([nid, {**d, "line": n.lineno}])
 
     def visit(body: list[ast.stmt], prefix: str, parent: str, cls: str | None) -> None:
         for n in body:

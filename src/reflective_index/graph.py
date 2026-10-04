@@ -21,7 +21,7 @@ from . import python_extractor, swift_extractor
 
 SCHEMA = "rr-csg-0.1+ri-ext-draft"
 ACCESS_ORDER = ("public", "member", "owner", "administrator")   # reflective-rust's AccessLevel, lowest first
-FACTS_VERSION = 2   # bump when an extractor's facts change shape, so cached facts are re-read
+FACTS_VERSION = 3   # bump when an extractor's facts change shape, so cached facts are re-read
 SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", "build", "dist", ".build", "DerivedData",
              ".reflective-index"}
 MAX_FILE_BYTES = 2_000_000
