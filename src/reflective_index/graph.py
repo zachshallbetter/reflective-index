@@ -224,7 +224,15 @@ class Index:
         return hits[0] if len(hits) == 1 else None
 
     def find(self, name: str, limit: int = 50) -> list[dict[str, Any]]:
-        exact = [n for n in self.nodes.values() if n["name"] == name or n["id"].endswith("::" + name)]
+        """Exact matches first: the name (a Swift one with or without its argument labels), or the qualified name or
+        its tail (`tldr`, `ReplyLines.tldr`, `ReplyLines.tldr(_:)`). Else substring matches on the id."""
+        def quals(n: dict[str, Any]) -> tuple[str, str]:
+            q = n["id"].split("::", 1)[1] if "::" in n["id"] else ""
+            return q, q.split("(", 1)[0]
+
+        exact = [n for n in self.nodes.values()
+                 if name in (n["name"], n["name"].split("(", 1)[0], *quals(n))
+                 or any(q.endswith("." + name) for q in quals(n))]
         if exact:
             return exact[:limit]
         low = name.lower()

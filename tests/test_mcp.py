@@ -12,6 +12,8 @@ class McpTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         root = Path(self.tmp.name)
         (root / "m.py").write_text("def a():\n    return b()\n\n\ndef b():\n    return 1\n")
+        (root / "pets.py").write_text("class Robin:\n    def go(self):\n        return 1\n\n\n"
+                                      "class Hale:\n    def go(self):\n        return 2\n")
         self.server = Server(str(root))
         self.server.index.cache_path = root / "cache.json"
 
@@ -41,6 +43,18 @@ class McpTest(unittest.TestCase):
         bad = self.call("read_symbol", symbol="nope")
         self.assertTrue(bad["isError"])
         self.assertEqual(self.rpc("no/such")["error"]["code"], -32601)
+
+    def test_an_ambiguous_name_answers_with_the_candidates(self):
+        out = self.call("callers", symbol="go")
+        self.assertTrue(out["isError"])
+        text = out["content"][0]["text"]
+        self.assertIn("py:pets.py::Robin.go", text)
+        self.assertIn("py:pets.py::Hale.go", text)
+        self.assertFalse(self.call("callees", symbol="Hale.go").get("isError"))
+
+    def test_swift_calls_flag(self):
+        self.assertFalse(self.server.index.swift_calls)
+        self.assertTrue(Server(self.tmp.name, swift_calls=True).index.swift_calls)
 
     def test_edit_only_when_allowed(self):
         self.assertTrue(self.call("replace_symbol", symbol="a", source="def a():\n    return 2\n")["isError"])
