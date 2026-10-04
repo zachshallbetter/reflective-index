@@ -14,14 +14,14 @@ from collections import defaultdict, deque
 from pathlib import Path
 from typing import Any, Iterable
 
-from . import python_extractor
+from . import python_extractor, swift_extractor
 
 SCHEMA = "rr-csg-0.1+ri-ext-draft"
 ACCESS_ORDER = ("public", "member", "owner", "administrator")   # reflective-rust's AccessLevel, lowest first
 SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", "build", "dist", ".build", "DerivedData",
              ".reflective-index"}
 MAX_FILE_BYTES = 2_000_000
-EXTRACTORS = {".py": python_extractor}
+EXTRACTORS = {".py": python_extractor, ".swift": swift_extractor}
 
 
 def permits(access: str, required: str) -> bool:
@@ -35,7 +35,7 @@ def _sha(data: bytes) -> str:
 
 class Index:
     def __init__(self, root: str | os.PathLike, cache: str | os.PathLike | None = None, access: str = "member",
-                 skip: Iterable[str] = ()):
+                 skip: Iterable[str] = (), swift_calls: bool = False):
         self.root = Path(root).resolve()
         self.cache_path = Path(cache or os.environ.get("REFLECTIVE_INDEX_CACHE")
                                or self.root / ".reflective-index" / "cache.json")
@@ -45,6 +45,10 @@ class Index:
         self.nodes: dict[str, dict[str, Any]] = {}
         self.edges: list[dict[str, Any]] = []
         self.unresolved = 0
+        # Swift calls come from a SwiftPM package's index store, which needs a build: only when asked for, cached by
+        # the package's file hashes (swift_extractor.package_calls).
+        self.swift_calls = swift_calls
+        self.package_edges: dict[str, dict[str, Any]] = {}
 
     # ── building ──────────────────────────────────────────────────────────────────────────────────
     def source_files(self) -> list[str]:
@@ -58,10 +62,12 @@ class Index:
 
     def build(self) -> "Index":
         old: dict[str, Any] = {}
+        old_pkg: dict[str, Any] = {}
         try:
             cached = json.loads(self.cache_path.read_text())
             if cached.get("schema") == SCHEMA and cached.get("access") == self.access:
                 old = cached.get("files", {})
+                old_pkg = cached.get("swift_calls", {})
         except (OSError, ValueError):
             pass
         self.files = {}
@@ -79,15 +85,44 @@ class Index:
             ext = EXTRACTORS[os.path.splitext(rel)[1]]
             try:
                 self.files[rel] = {"hash": h, "facts": ext.extract(rel, data.decode("utf-8", "replace"), self.access)}
-            except (SyntaxError, ValueError, RecursionError) as exc:
+            except (SyntaxError, ValueError, RecursionError, swift_extractor.LSPError, OSError) as exc:
                 self.files[rel] = {"hash": h, "error": f"{type(exc).__name__}: {exc}"[:200]}
+        self.package_edges = self._swift_packages(old_pkg) if self.swift_calls else {}
         self._link()
         try:
             self.cache_path.parent.mkdir(parents=True, exist_ok=True)
-            self.cache_path.write_text(json.dumps({"schema": SCHEMA, "access": self.access, "files": self.files}))
+            self.cache_path.write_text(json.dumps({"schema": SCHEMA, "access": self.access, "files": self.files,
+                                                   "swift_calls": self.package_edges}))
         except OSError:
             pass
         return self
+
+    def _swift_packages(self, old: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        """Each SwiftPM package's call edges: reused while none of its Swift files changed, else from a fresh build of
+        its index store (in the cache directory, never the package's own .build)."""
+        swift = [r for r in self.files if r.endswith(".swift") and "facts" in self.files[r]]
+        out: dict[str, dict[str, Any]] = {}
+        for pkg in swift_extractor.find_packages(str(self.root), swift):
+            mine = sorted(r for r in swift if pkg == "" or r.startswith(pkg + os.sep))
+            key = _sha("".join(self.files[r]["hash"] for r in mine).encode())
+            if old.get(pkg, {}).get("key") == key:
+                out[pkg] = old[pkg]
+                continue
+            scratch = str(self.cache_path.parent / "swiftpm" / (pkg.replace(os.sep, "_") or "root"))
+            if not swift_extractor.build_index(str(self.root), pkg, scratch):
+                out[pkg] = {"key": None, "edges": [], "outside": 0, "error": "swift build failed"}
+                continue
+            functions, spans = {}, []
+            for r in mine:
+                facts = self.files[r]["facts"]
+                for n in facts["nodes"]:
+                    if n["kind"] in ("function", "method"):
+                        spans.append((r, n["span"]["start_line"], n["span"]["end_line"], n["id"]))
+                        if n["id"] in facts.get("anchors", {}):
+                            functions[n["id"]] = (r, facts["anchors"][n["id"]])
+            edges, outside = swift_extractor.package_calls(str(self.root), pkg, functions, spans, scratch)
+            out[pkg] = {"key": key, "edges": edges, "outside": outside}
+        return out
 
     def _resolve_module(self, dotted: str, importer: str) -> str | None:
         """A dotted import to a file in the repo: a package path from the root, or a sibling module (scripts that
@@ -115,7 +150,7 @@ class Index:
             facts = f.get("facts")
             if not facts:
                 continue
-            mod = f"py:{rel}"
+            mod = facts.get("module", f"py:{rel}")
             for a, b in facts["contains"]:
                 edge(a, b, "contains")
             alias_mod: dict[str, str] = {}
@@ -143,6 +178,9 @@ class Index:
                     edge(caller, target, d.get("rel", "calls"))
                 else:
                     self.unresolved += 1
+        for pkg in self.package_edges.values():   # Swift: already resolved by the index store
+            for a, b, r in pkg.get("edges", []):
+                edge(a, b, r)
 
     # ── queries ───────────────────────────────────────────────────────────────────────────────────
     def visible(self, n: dict[str, Any], access: str | None = None) -> bool:
@@ -216,6 +254,9 @@ class Index:
         if not n or n["kind"] == "module":
             return {"ok": False, "error": "not a class, function or method in the index"}
         rel = n["span"]["file"]
+        if not rel.endswith(".py"):
+            # The re-parse check is what makes replace safe, and Swift's symbol reader takes broken code without a word.
+            return {"ok": False, "error": "replace is for Python symbols only (Swift has no parse check here yet)"}
         path = self.root / rel
         lines = path.read_text().splitlines(keepends=True)
         s, e = n["span"]["start_line"], n["span"]["end_line"]

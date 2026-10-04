@@ -1,0 +1,311 @@
+"""Swift facts from sourcekit-lsp, the Swift toolchain's language server, spoken to over stdio.
+
+Structure, one file at a time (`extract`), from `textDocument/documentSymbol`. It's syntactic, so a file needs no build:
+  nodes     module, class, struct, enum, protocol, extension, function, method (initializers are methods)
+  contains  parent → child
+Calls, for a SwiftPM package (`package_calls`), from the package's index store (`swift build` writes it) through
+`callHierarchy/outgoingCalls`: an edge only where the index names the callee's definition in the repository. Calls into
+the SDK or anything else outside the tree aren't edges and aren't guesses.
+
+Ids:
+  swift:<path>                              the file
+  swift:<path>::<Type>                      a type (nested: Outer.Inner)
+  swift:<path>::<Type>.<member>             a method, with its argument labels: Robin.greet(), Robin.init(name:)
+  swift:<path>::<function>                  a top-level function
+  swift:<path>::extension <Type>            an extension (a second one in the file: extension <Type> #2)
+A member declared in an extension belongs to its type: swift:<path>::<Type>.<member>, contained by the extension.
+"""
+from __future__ import annotations
+
+import atexit
+import json
+import os
+import subprocess
+import threading
+from typing import Any
+
+LANGUAGE = "swift"
+
+# LSP SymbolKind → node kind. Properties, enum cases and variables aren't nodes (the Python side has none either).
+KINDS = {5: "class", 23: "struct", 10: "enum", 11: "protocol", 3: "extension", 6: "method", 9: "method",
+         12: "function"}
+TYPE_KINDS = {"class", "struct", "enum", "protocol", "extension"}
+
+
+class LSPError(RuntimeError):
+    pass
+
+
+class LSP:
+    """One sourcekit-lsp process over stdio, kept for the whole build (its first request costs about half a second)."""
+
+    def __init__(self, root: str, args: list[str] | None = None):
+        cmd = ["xcrun", "sourcekit-lsp"] if os.uname().sysname == "Darwin" else ["sourcekit-lsp"]
+        self.proc = subprocess.Popen(cmd + list(args or []), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                     stderr=subprocess.DEVNULL)
+        self.lock = threading.Lock()
+        self.next_id = 0
+        self.request("initialize", {"processId": os.getpid(), "rootUri": "file://" + os.path.abspath(root),
+                                    "capabilities": {"textDocument": {
+                                        "documentSymbol": {"hierarchicalDocumentSymbolSupport": True},
+                                        "callHierarchy": {}}}})
+        self.notify("initialized", {})
+
+    def _send(self, msg: dict[str, Any]) -> None:
+        body = json.dumps(msg).encode()
+        assert self.proc.stdin is not None
+        self.proc.stdin.write(b"Content-Length: %d\r\n\r\n" % len(body) + body)
+        self.proc.stdin.flush()
+
+    def _recv(self) -> dict[str, Any]:
+        assert self.proc.stdout is not None
+        headers: dict[str, str] = {}
+        while True:
+            line = self.proc.stdout.readline()
+            if not line:
+                raise LSPError("sourcekit-lsp exited")
+            line = line.decode().strip()
+            if not line:
+                break
+            k, _, v = line.partition(":")
+            headers[k.lower()] = v.strip()
+        return json.loads(self.proc.stdout.read(int(headers["content-length"])))
+
+    def notify(self, method: str, params: dict[str, Any]) -> None:
+        with self.lock:
+            self._send({"jsonrpc": "2.0", "method": method, "params": params})
+
+    def request(self, method: str, params: dict[str, Any]) -> Any:
+        with self.lock:
+            self.next_id += 1
+            rid = self.next_id
+            self._send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
+            while True:
+                m = self._recv()
+                if m.get("id") == rid and "method" not in m:
+                    if "error" in m:
+                        raise LSPError(str(m["error"].get("message", m["error"]))[:200])
+                    return m.get("result")
+                if "method" in m and "id" in m:   # a request from the server (progress, config): answer it empty
+                    self._send({"jsonrpc": "2.0", "id": m["id"], "result": None})
+
+    def close(self) -> None:
+        try:
+            self.request("shutdown", {})
+            self.notify("exit", {})
+        except (LSPError, OSError, BrokenPipeError):
+            pass
+        try:
+            self.proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+            self.proc.wait()
+        for pipe in (self.proc.stdin, self.proc.stdout):
+            try:
+                if pipe:
+                    pipe.close()
+            except OSError:
+                pass
+
+
+_shared: LSP | None = None
+
+
+def _server() -> LSP:
+    """The structure pass's server: rootless (documentSymbol needs no build settings), one per process."""
+    global _shared
+    if _shared is None:
+        _shared = LSP(os.getcwd())
+        atexit.register(_shared.close)
+    return _shared
+
+
+def symbols(rel: str, source: str, lsp: LSP | None = None) -> list[dict[str, Any]]:
+    """documentSymbol for this text, opened under a synthetic URI and closed again (nothing read from disk)."""
+    s = lsp or _server()
+    uri = "file:///reflective-index/" + rel.replace(os.sep, "/")
+    s.notify("textDocument/didOpen", {"textDocument": {"uri": uri, "languageId": "swift", "version": 1, "text": source}})
+    try:
+        return s.request("textDocument/documentSymbol", {"textDocument": {"uri": uri}}) or []
+    finally:
+        s.notify("textDocument/didClose", {"textDocument": {"uri": uri}})
+
+
+def extract(rel: str, source: str, access: str, lsp: LSP | None = None) -> dict[str, Any]:
+    mod_id = f"swift:{rel}"
+    lines = source.splitlines(keepends=True)
+    line_bytes = [len(ln.encode()) for ln in lines]
+
+    def size(s: int, e: int) -> int:
+        return sum(line_bytes[s - 1:e])
+
+    nodes = [{"id": mod_id, "name": os.path.splitext(os.path.basename(rel))[0], "kind": "module",
+              "span": {"file": rel, "start_line": 1, "end_line": max(1, len(lines))},
+              "minimum_access": access, "size_bytes": sum(line_bytes)}]
+    contains: list[list[str]] = []
+    # Where each function's name is (0-based line, character), for the call pass: the index answers by position.
+    anchors: dict[str, list[int]] = {}
+    seen: dict[str, int] = {}
+
+    def unique(nid: str) -> str:
+        n = seen.get(nid, 0) + 1
+        seen[nid] = n
+        return nid if n == 1 else f"{nid} #{n}"
+
+    def visit(syms: list[dict[str, Any]], type_path: str, parent: str) -> None:
+        for s in syms:
+            kind = KINDS.get(s.get("kind"))
+            name = str(s.get("name") or "")
+            if not kind or not name:
+                continue
+            start = s["range"]["start"]["line"] + 1
+            end = max(start, s["range"]["end"]["line"] + 1)
+            if kind == "extension":
+                qual, member_path = f"extension {name}", name
+            elif kind in TYPE_KINDS:
+                qual = member_path = f"{type_path}.{name}" if type_path else name
+            else:
+                qual, member_path = (f"{type_path}.{name}" if type_path else name), type_path
+                if kind == "method" and not type_path:
+                    kind = "function"
+                if kind == "function" and type_path:
+                    kind = "method"
+            nid = unique(f"{mod_id}::{qual}")
+            nodes.append({"id": nid, "name": name if kind != "extension" else qual, "kind": kind,
+                          "span": {"file": rel, "start_line": start, "end_line": end},
+                          "minimum_access": access, "size_bytes": size(start, end)})
+            contains.append([parent, nid])
+            if kind in ("method", "function"):
+                sel = s.get("selectionRange", s["range"])["start"]
+                anchors[nid] = [sel["line"], sel["character"]]
+            if kind in TYPE_KINDS:
+                visit(s.get("children") or [], member_path, nid)
+
+    visit(symbols(rel, source, lsp), "", mod_id)
+    return {"language": LANGUAGE, "module": mod_id, "nodes": nodes, "contains": contains, "imports": {}, "from_imports": {}, "calls": [],
+            "anchors": anchors}
+
+
+# ── calls: a SwiftPM package's index store ─────────────────────────────────────────────────────────────
+
+def find_packages(root: str, rels: list[str]) -> list[str]:
+    """Directories (relative to root) with a Package.swift that hold indexed Swift files."""
+    dirs = set()
+    for rel in rels:
+        d = os.path.dirname(rel)
+        while True:
+            if os.path.isfile(os.path.join(root, d, "Package.swift")):
+                dirs.add(d)
+                break
+            if not d:
+                break
+            d = os.path.dirname(d)
+    return sorted(dirs)
+
+
+def build_index(root: str, package: str, scratch: str, timeout: int = 1800) -> bool:
+    """`swift build` into its own scratch path (never the package's own .build), which writes the index store."""
+    r = subprocess.run(["swift", "build", "--enable-index-store", "--package-path", os.path.join(root, package),
+                        "--scratch-path", scratch], capture_output=True, timeout=timeout)
+    return r.returncode == 0
+
+
+def package_calls(root: str, package: str, functions: dict[str, tuple[str, list[int]]],
+                  spans: list[tuple[str, int, int, str]], scratch: str,
+                  ready_timeout: float = 30.0, workers: int | None = None) -> tuple[list[list[str]], int]:
+    """Call edges among this package's functions, from its index store, by several sourcekit-lsp servers at once (each
+    answers one request at a time). `functions`: node id → (file rel, name position); `spans`: (file rel, start line,
+    end line, node id) of every function and method. Returns (edges, how many calls led outside the tree)."""
+    from concurrent.futures import ThreadPoolExecutor
+    # Whole files to each server: opening a file makes its server type-check it, so a file shouldn't be opened by all.
+    by_file: dict[str, dict[str, tuple[str, list[int]]]] = {}
+    for nid, v in functions.items():
+        by_file.setdefault(v[0], {})[nid] = v
+    n = max(1, min(workers or max(1, (os.cpu_count() or 2) // 2), 8, len(by_file) or 1))
+    chunks: list[dict[str, tuple[str, list[int]]]] = [{} for _ in range(n)]
+    for f, fns in sorted(by_file.items(), key=lambda kv: -len(kv[1])):   # largest first, onto the lightest chunk
+        min(chunks, key=len).update(fns)
+    with ThreadPoolExecutor(max_workers=n) as pool:
+        results = list(pool.map(lambda c: _package_calls_one(root, package, c, spans, scratch, ready_timeout), chunks))
+    edges = [e for r in results for e in r[0]]
+    return edges, sum(r[1] for r in results)
+
+
+def _package_calls_one(root: str, package: str, functions: dict[str, tuple[str, list[int]]],
+                  spans: list[tuple[str, int, int, str]], scratch: str,
+                  ready_timeout: float = 30.0) -> tuple[list[list[str]], int]:
+    """Call edges among this package's functions, from its index store. `functions`: node id → (file rel, anchor);
+    `spans`: (file rel, start line, end line, node id) of every function and method, innermost-first resolution.
+    Returns (edges, how many calls led outside the tree)."""
+    by_file: dict[str, list[tuple[int, int, str]]] = {}
+    for f, s, e, nid in spans:
+        by_file.setdefault(f, []).append((s, e, nid))
+
+    def target(rel: str, line: int) -> str | None:
+        best = None
+        for s, e, nid in by_file.get(rel, []):
+            if s <= line <= e and (best is None or e - s < best[1] - best[0]):
+                best = (s, e, nid)
+        return best[2] if best else None
+
+    lsp = LSP(os.path.join(root, package), ["--scratch-path", scratch])
+    edges: list[list[str]] = []
+    outside = 0
+    opened: set[str] = set()
+    root_abs = os.path.abspath(root)
+
+    def open_file(path: str) -> str:
+        uri = "file://" + path
+        if uri not in opened:
+            text = open(path, encoding="utf-8", errors="replace").read()
+            lsp.notify("textDocument/didOpen", {"textDocument": {"uri": uri, "languageId": "swift", "version": 1,
+                                                                "text": text}})
+            opened.add(uri)
+        return uri
+
+    try:
+        # The server loads the package and its index store in the background after it starts: until it has, call
+        # hierarchy answers nothing. Wait (up to ready_timeout) until the first function resolves.
+        import time
+        deadline = time.monotonic() + ready_timeout
+        first = next(iter(functions.items()), None)
+        while first and time.monotonic() < deadline:
+            rel0, (line0, ch0) = first[1]
+            try:
+                if lsp.request("textDocument/prepareCallHierarchy",
+                               {"textDocument": {"uri": open_file(os.path.join(root_abs, rel0))},
+                                "position": {"line": line0, "character": ch0}}):
+                    break
+            except (LSPError, OSError):
+                pass
+            time.sleep(0.5)
+        for nid, (rel, (line, ch)) in functions.items():
+            try:
+                uri = open_file(os.path.join(root_abs, rel))
+            except OSError:
+                continue
+            try:
+                items = lsp.request("textDocument/prepareCallHierarchy",
+                                    {"textDocument": {"uri": uri}, "position": {"line": line, "character": ch}}) or []
+            except LSPError:
+                continue
+            for item in items[:1]:
+                try:
+                    out = lsp.request("callHierarchy/outgoingCalls", {"item": item}) or []
+                except LSPError:
+                    continue
+                for call in out:
+                    to = call.get("to") or {}
+                    tpath = str(to.get("uri", ""))[len("file://"):]
+                    if not tpath.startswith(root_abs + os.sep):
+                        outside += 1
+                        continue
+                    trel = os.path.relpath(tpath, root_abs)
+                    tnid = target(trel, (to.get("selectionRange") or to.get("range") or {}).get("start", {}).get("line", -1) + 1)
+                    if tnid and tnid != nid:
+                        edges.append([nid, tnid, "calls"])
+                    elif not tnid:
+                        outside += 1
+    finally:
+        lsp.close()
+    return edges, outside

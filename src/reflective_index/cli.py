@@ -9,7 +9,8 @@
   slice SYMBOL [RADIUS]    it and its neighbourhood, with edges (JSON)
   csg                      the whole graph (JSON)
 
-SYMBOL is an id (py:path/file.py::Class.method) or a name that matches exactly one symbol.
+SYMBOL is an id (py:path/file.py::Class.method, swift:path/File.swift::Type.method()) or a name that matches exactly
+one symbol. --swift-calls also links Swift calls for SwiftPM packages (it builds each package's index store once).
 """
 from __future__ import annotations
 
@@ -29,7 +30,9 @@ def main(argv: list[str] | None = None) -> int:
     if len(argv) < 2 or argv[0] in ("-h", "--help"):
         print(__doc__)
         return 0 if argv[:1] in (["-h"], ["--help"]) else 2
-    idx = Index(argv[0]).build()
+    swift_calls = "--swift-calls" in argv
+    argv = [a for a in argv if a != "--swift-calls"]
+    idx = Index(argv[0], swift_calls=swift_calls).build()
     cmd, args = argv[1], argv[2:]
     if cmd == "stats":
         print(json.dumps(idx.stats(), indent=2))
