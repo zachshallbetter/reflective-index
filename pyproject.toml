@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "reflective-index"
+version = "0.1.0"
+description = "A local semantic index of a codebase, emitted as a CSG-shaped graph and served over MCP"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+reflective-index = "reflective_index.cli:main"
+reflective-index-mcp = "reflective_index.mcp:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
