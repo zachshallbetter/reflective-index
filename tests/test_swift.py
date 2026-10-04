@@ -64,6 +64,11 @@ class TestSwiftStructure(unittest.TestCase):
                              ["swift:loose/Shapes.swift::Greeter", "swift:loose/Shapes.swift::Greeter.greet()",
                               "swift:loose/Shapes.swift::Robin"])
             self.assertIn("swift", idx.csg()["provenance"]["languages"])
+            # a bare name without its labels: the candidates; Type.member: the one
+            p = "swift:loose/Shapes.swift"
+            self.assertEqual({n["id"] for n in idx.find("greet")}, {f"{p}::Greeter.greet()", f"{p}::Robin.greet()"})
+            self.assertIsNone(idx.node("greet"))
+            self.assertEqual(idx.node("Robin.greet")["id"], f"{p}::Robin.greet()")
             self.assertFalse(idx.replace("swift:loose/Shapes.swift::topLevel()", "func topLevel() -> Int {")["ok"],
                              "replace refuses Swift")
 

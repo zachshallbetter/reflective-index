@@ -45,7 +45,10 @@ def main(argv: list[str] | None = None) -> int:
     elif cmd in ("callers", "callees", "read", "slice") and args:
         n = idx.node(args[0])
         if not n:
-            print(f"no single symbol matches {args[0]!r}; try `find`", file=sys.stderr)
+            hits = idx.find(args[0], limit=12)
+            print(f"no single symbol matches {args[0]!r}" + (
+                "; it could be one of these (pass its id):\n" + "\n".join(brief(h) for h in hits) if hits else "; try `find`"),
+                file=sys.stderr)
             return 1
         if cmd == "read":
             print(idx.read(n["id"]))

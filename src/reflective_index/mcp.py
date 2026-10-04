@@ -1,9 +1,11 @@
 """A Model Context Protocol server over stdio (newline-delimited JSON-RPC 2.0), standard library only.
 
-  reflective-index-mcp ROOT [--allow-edit]
+  reflective-index-mcp ROOT [--allow-edit] [--swift-calls]
 
 Tools: outline, find, callers, callees, read_symbol, slice, stats, and with --allow-edit replace_symbol.
 Read-only by default. The index is rebuilt before each call, which costs a cache check unless files changed.
+--swift-calls links Swift calls for SwiftPM packages (the first call builds each package's index store, minutes on a
+large package; after that, until a Swift file changes, it's a cache check like the rest).
 
 An MCP client, in a project's .mcp.json:
   {"mcpServers": {"reflective-index": {"command": "reflective-index-mcp", "args": ["."]}}}
@@ -19,7 +21,9 @@ from .cli import brief
 from .graph import Index
 
 PROTOCOL = "2025-06-18"
-_SYM = {"type": "string", "description": "A symbol id (py:path/file.py::Class.method) or a name that matches one symbol"}
+_SYM = {"type": "string", "description": "A symbol id (py:path/file.py::Class.method, swift:Sources/X.swift::Type.member(_:)) "
+                                        "or a name that matches one symbol (Type.member works); an ambiguous name answers "
+                                        "with the candidate ids to choose from"}
 TOOLS: list[dict[str, Any]] = [
     {"name": "outline", "description": "A file's classes, functions and methods with line ranges. Use instead of reading a large file.",
      "inputSchema": {"type": "object", "properties": {"file": {"type": "string", "description": "Path relative to the repo root"}},
@@ -51,8 +55,8 @@ EDIT_TOOL = {"name": "replace_symbol",
 
 
 class Server:
-    def __init__(self, root: str, allow_edit: bool = False):
-        self.index = Index(root)
+    def __init__(self, root: str, allow_edit: bool = False, swift_calls: bool = False):
+        self.index = Index(root, swift_calls=swift_calls)
         self.allow_edit = allow_edit
 
     def tools(self) -> list[dict[str, Any]]:
@@ -61,8 +65,10 @@ class Server:
     def _sym(self, ref: str) -> dict[str, Any]:
         n = self.index.node(ref)
         if not n:
-            hits = self.index.find(ref, limit=8)
-            raise ValueError(f"no single symbol matches {ref!r}" + (": " + ", ".join(h["id"] for h in hits) if hits else ""))
+            hits = self.index.find(ref, limit=12)
+            raise ValueError(f"no single symbol matches {ref!r}" + (
+                "; it could be one of these, so pass the id you mean:\n" + "\n".join(brief(h) for h in hits)
+                if hits else "; try find"))
         return n
 
     def call(self, name: str, args: dict[str, Any]) -> str:
@@ -113,7 +119,7 @@ class Server:
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     root = next((a for a in argv if not a.startswith("--")), ".")
-    server = Server(root, allow_edit="--allow-edit" in argv)
+    server = Server(root, allow_edit="--allow-edit" in argv, swift_calls="--swift-calls" in argv)
     for line in sys.stdin:
         line = line.strip()
         if not line:

@@ -69,6 +69,9 @@ Calls into a builtin or a module outside the repository aren't gaps, so they are
 {"mcpServers": {"reflective-index": {"command": "reflective-index-mcp", "args": ["."]}}}
 ```
 
+Add `"--swift-calls"` to the args for a Swift package's call edges (the first call builds its index store).
+A name that matches more than one symbol is answered with the candidate ids, so a caller can pick one.
+
 The tools are `outline`, `find`, `callers`, `callees`, `read_symbol`, `slice` and `stats`, all read-only.
 Start it with `--allow-edit` to add `replace_symbol`. It swaps one symbol's source, re-parses the file, and
 refuses, leaving the file untouched, when the result doesn't parse or no longer defines that symbol.
