@@ -115,4 +115,4 @@ SwiftPM packages only and need a Swift toolchain; files outside a package get st
 
 ## License
 
-No license is declared yet.
+MIT. See [LICENSE](LICENSE).
