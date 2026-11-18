@@ -99,3 +99,20 @@ already present); after a Swift file changes, about 15 s (an incremental build a
 ```sh
 PYTHONPATH=src python3 -m unittest discover -s tests
 ```
+
+## Repository map
+
+- `src/reflective_index/`: the package. `python_extractor.py` and `swift_extractor.py` read source, `graph.py` holds the
+  graph, `indexstore.py` reads Swift's compiler index store, `cli.py` is the `reflective-index` command and `mcp.py` the
+  `reflective-index-mcp` server.
+- `docs/SCHEMA.md`: the graph schema, a draft extension of `rr-csg-0.1`.
+- `tests/`: `unittest` modules, with Swift fixtures in `tests/fixtures/swift/`.
+
+## Status and limitations
+
+Version 0.1.0 (`pyproject.toml`); no release is tagged. Python and Swift are the only languages. Swift call edges cover
+SwiftPM packages only and need a Swift toolchain; files outside a package get structure only. The schema is a draft.
+
+## License
+
+No license is declared yet.
