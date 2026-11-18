@@ -1,0 +1,20 @@
+name: Feature request
+description: Propose a new capability or option for reflective-index.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The behavior you want
+      description: What should reflective-index do? What's the use case?
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: How you imagine it
+      description: An option, an API, a command, or a change to existing behavior.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
